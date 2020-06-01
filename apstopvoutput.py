@@ -73,9 +73,9 @@ def getDataFromAPS(wanted_day):
         'date': wanted_date
     }
 
-    logging.info('Requesting %s from %s...', data, APSYSTEMS_URL)
+    logger.info('Requesting %s from %s...', data, APSYSTEMS_URL)
     response = requests.post(APSYSTEMS_URL, headers=headers, data=data)
-    logging.debug(response)
+    logger.debug(response)
     return response.json();
 
 def getWeather(df_resampled, inplace=True):
@@ -285,8 +285,6 @@ def plot_pv_data(df, df_resampled, title):
     fig.autofmt_xdate()
 
 if __name__ == '__main__':
-    setupLogger()
-
     import argparse
 
     parser = argparse.ArgumentParser(description='Downloads data from apsystem and uploads to pvoutput.org')
@@ -296,19 +294,24 @@ if __name__ == '__main__':
     parser.add_argument('--pvoutput', action='store_true',
                         default=False,
                         help='Optionally upload data to pvoutput.org')
+    parser.add_argument('--tibber', action='store_true',
+                        default=False,
+                        help='Optionally download data from tibber.com')
     parser.add_argument('--max_days', '-d', default=30,
                         help='Specify the maximum number of days to process. Defaults to 30 days')
+    levels = ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')
+    parser.add_argument('--log_level', default='INFO', choices=levels)
     
     args = parser.parse_args()
 
-    tibber_data = getTibberConsumption()
+    setupLogger(level=args.log_level)
+
+    tibber_data = None
     
     day_count = 0
     wanted_date = getDateString()
     while wanted_date != '' and day_count < int(args.max_days):
         rootdict = getDataFromAPS(wanted_date)
-        print(rootdict.keys())
-        print(rootdict['data'].keys())
         timesstring = rootdict.get("data").get("time")
         powersstring = rootdict.get("data").get("power")
 
@@ -318,7 +321,7 @@ if __name__ == '__main__':
         # add the date:
         timelist = list(map(lambda x: wanted_date + ' ' + x, timelist))
         for ix in range(len(powerlist)):
-            print(timelist[ix], powerlist[ix])
+            logger.debug('APS row: %s, %s', timelist[ix], powerlist[ix])
 
         # convert to pandas time
         timelist = pd.to_datetime(timelist)
@@ -334,6 +337,10 @@ if __name__ == '__main__':
         except APIRequestError as e:
             logger.exception(e)
 
+        if args.tibber:
+            if tibber_data is None:
+                tibber_data = getTibberConsumption()
+        
         if args.pvoutput:
             # upload to pvoutput
             sendUpdateToPVOutput(df, df_resampled, total_kwh, tibber_data)
