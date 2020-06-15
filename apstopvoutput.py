@@ -9,6 +9,8 @@ import os.path
 
 # simple re-sample to every hour
 import pandas as pd
+import numpy as np
+import scipy.integrate
 # weather info
 from pyowm.owm import OWM
 from pyowm.commons.exceptions import APIRequestError
@@ -18,9 +20,6 @@ import pylab as plt
 import matplotlib.dates as mdates
 
 from my_api_keys import *
-
-#enter a path and filename below, a file wil be create to save the last update datetime
-LAST_UPDATE_FILE = "last_update_file.txt" # keep a record of latest date uploaded
 
 #usually all below this point should not be modified
 APSYSTEMS_URL = 'http://api.apsystemsema.com:8073/apsema/v1/ecu/getPowerInfo'
@@ -51,11 +50,14 @@ def setupLogger(level=logging.DEBUG):
     logger.propagate = False
     logger.addHandler(l_handler)
 
-def getDateString():
-    try:
-        wanted_day = read_date_from_file(LAST_UPDATE_FILE) + timedelta(days=1)
-    except FileNotFoundError: # first iteration
-        wanted_day = datetime.strptime(FIRST_DATE, "%Y%m%d")
+def getDateString(last_update_date=None):
+    if last_update_date is None: # no user overwrite, use file
+        try:
+            wanted_day = read_date_from_file(LAST_UPDATE_FILE) + timedelta(days=1)
+        except FileNotFoundError: # first iteration
+            wanted_day = datetime.strptime(FIRST_DATE, "%Y%m%d")
+    else:
+        wanted_day = datetime.strptime(last_update_date, "%Y%m%d") + timedelta(days=1)
     
     if datetime.today().date() <= wanted_day.date():
         return '' # if today, stop
@@ -151,6 +153,7 @@ def sendUpdateToPVOutput(df, df_resampled, total_kwh, tibber_data=None):
                               'overcast clouds': 'Cloudy',
                               'mist': 'Cloudy',
                               'shower rain': 'Showers',
+                              'light rain': 'Showers',
                               'rain': 'Showers',
                               'thunderstorm': 'Showers',
                               'snow': 'Snow'}
@@ -175,7 +178,13 @@ def sendUpdateToPVOutput(df, df_resampled, total_kwh, tibber_data=None):
             import_shoulder = ''
             import_high_shoulder = ''
 
-            consumption = 1e3*(tibber_data.loc[ix, 'Consumption [kWh]'].sum() + tibber_data.loc[ix, 'Production [kWh]'].sum())
+            # Tibber definition of consumption and production is confusing
+            # consumption is amount bought
+            # production is amount sold
+            # each hour can contain both consumption and production
+            consumption = 1e3*(tibber_data.loc[ix, 'Consumption [kWh]'].sum() - tibber_data.loc[ix, 'Production [kWh]'].sum())
+            # add generated solar power
+            consumption += generated
 
             if len(data) == 5:
                 # pad with empty data
@@ -284,10 +293,14 @@ def plot_pv_data(df, df_resampled, title):
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
     fig.autofmt_xdate()
 
+
+
 if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description='Downloads data from apsystem and uploads to pvoutput.org')
+    parser.add_argument('--last_update_date', 
+                        help='Overwrites the last_update_file and use the provided date instead. Analysed date will be +1 day.')
     parser.add_argument('--plot', action='store_true',
                         default=False,
                         help='Optionally plot data')
@@ -309,7 +322,7 @@ if __name__ == '__main__':
     tibber_data = None
     
     day_count = 0
-    wanted_date = getDateString()
+    wanted_date = getDateString(args.last_update_date)
     while wanted_date != '' and day_count < int(args.max_days):
         rootdict = getDataFromAPS(wanted_date)
         timesstring = rootdict.get("data").get("time")
@@ -329,8 +342,21 @@ if __name__ == '__main__':
         df = pd.DataFrame(powerlist, index=timelist, columns=['Power [W]'], dtype=int)
         
         # Resample to whole hours and calculate kWh
-        df_resampled = df.resample('H').mean()
-        total_kwh = df_resampled['Power [W]'].mean()*24/1e3 # not sure if this is right, should probably do a better numerical integration
+        #df_resampled = df.resample('H').mean()
+        dx = 1#(df.index[1] - df.index[0]).total_seconds()/3600
+        def simpson(array_like):
+            # https://stackoverflow.com/a/46787626
+            array_like = array_like.values.astype(float)
+            I = scipy.integrate.simps(array_like, dx=dx)
+            logger.debug('simpson(%s) = %s', array_like, I)
+            return I
+
+        # not sure if this is right, try to integrate total power
+        df_resampled = df.resample('H').apply(simpson)
+        sample_rate_s = np.median(np.diff(df.index)).item()*1e-9
+        df_resampled['Power [W]'] *= sample_rate_s/3600
+        total_kwh = df_resampled['Power [W]'].mean()*24/1e3
+        logger.info('Estimated energy production %.0f kWh' % total_kwh)
 
         try:
             getWeather(df_resampled, inplace=True)

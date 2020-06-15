@@ -5,3 +5,6 @@ OPENWEATHER = '<INSERT openweather api key>' # Register for free and find at htt
 LON=10.83576; LAT=59.71949 # coordinates for weather
 FIRST_DATE = '20200523' # first date you want uploaded, on first run, script will loop from this date to yesterday
 TIBBER_TOKEN = '<INSERT TIBBER TOKEN>' # for tibber electricity customers, use https://developer.tibber.com/settings/accesstoken
+
+#enter a path and filename below, a file wil be create to save the last update datetime
+LAST_UPDATE_FILE = "last_update_file.txt" # keep a record of latest date uploaded
