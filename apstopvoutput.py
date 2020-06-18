@@ -5,6 +5,7 @@ logger = logging.getLogger(__name__)
 import requests
 import json
 from datetime import date, datetime, timedelta
+import base64
 import os.path
 
 # simple re-sample to every hour
@@ -121,7 +122,7 @@ def getWeather(df_resampled, inplace=True):
     
     return df_resampled
 
-def sendUpdateToPVOutput(df, df_resampled, total_kwh, tibber_data=None):
+def sendUpdateToPVOutput(df, df_resampled, total_kwh, tibber_sum=None):
     output_date = df_resampled.index[0].strftime('%Y%m%d')
     generated = total_kwh*1e3
     exported = ''
@@ -169,31 +170,29 @@ def sendUpdateToPVOutput(df, df_resampled, total_kwh, tibber_data=None):
         logger.info('Weather = %s -> %s. detailed=%s' % (status, condition, comment))
         data.extend([condition, min_temp, max_temp, comment])
 
-    if tibber_data is not None:
-        # try to find correct date
-        ix = tibber_data.index.strftime('%Y%m%d') == output_date
-        if any(ix):
-            import_peak = ''
-            import_off_peak = ''
-            import_shoulder = ''
-            import_high_shoulder = ''
+    if 'Consumption [Wh]' in df_resampled:
+        import_peak = ''#df_resampled['Consumption [Wh]'].max()
+        import_off_peak = ''
+        import_shoulder = ''
+        import_high_shoulder = ''
 
-            # Tibber definition of consumption and production is confusing
-            # consumption is amount bought
-            # production is amount sold
-            # each hour can contain both consumption and production
-            consumption = 1e3*(tibber_data.loc[ix, 'Consumption [kWh]'].sum() - tibber_data.loc[ix, 'Production [kWh]'].sum())
-            # add generated solar power
-            consumption += generated
+        # Tibber definition of consumption and production is confusing
+        # consumption is amount bought
+        # production is amount sold
+        # each hour can contain both consumption and production
+        #1e3*(tibber_data.loc[ix, 'Consumption [Wh]'].sum() - tibber_data.loc[ix, 'Production [Wh]'].sum())
+        consumption = -tibber_sum[1] # add net_energy
+        print('consumption1', consumption)
+        # add generated solar power
+        consumption += generated
+        print('consumption2', generated, consumption)
 
-            if len(data) == 5:
-                # pad with empty data
-                data.extend([condition, min_temp, max_temp, comment])
-                logger.debug('No weather data, padding data %s', data)
-                
-            data.extend([import_peak, import_off_peak, import_shoulder, import_high_shoulder, consumption])
-        else:
-            logger.warning('Tibber data does not contain requested date %s', output_date)
+        if len(data) == 5:
+            # pad with empty data
+            data.extend([condition, min_temp, max_temp, comment])
+            logger.debug('No weather data, padding data %s', data)
+
+        data.extend([import_peak, import_off_peak, import_shoulder, import_high_shoulder, consumption])
 
     def my_float_to_str(s):
         try:
@@ -215,18 +214,27 @@ def sendUpdateToPVOutput(df, df_resampled, total_kwh, tibber_data=None):
     logger.info("Response: %s", r.text)
     r.raise_for_status()
 
-def getTibberConsumption(last_n_days = 30):
-    # there is some kind of support for before and after (date??) string, but I can't figure ut out, so just query the last 30 days and pick out the wanted date from that.
+def getTibberConsumption(df_resampled, wanted_date, inplace=False):
+    if not(inplace):
+        df_resampled = pd.DataFrame(df_resampled)
+
+    # Undocumented usage of the after key, is a base64 encoded version of a iso-formatted string
+    d = datetime.strptime(wanted_date, "%Y%m%d") - timedelta(hours=1)
+    d_isoformat = d.isoformat()
+    query_after = base64.b64encode(d_isoformat.encode('utf8')).decode('utf8')
+    logger.debug('tibber isoformat = %s, encoded = %s', d_isoformat, query_after)
+    max_records = 24
+    
     query = """
     {
         viewer {
             homes {
-                consumption(resolution: DAILY, last: %d) {
+                consumption(resolution: HOURLY, first: %d, after: "%s") {
                     nodes {
                         from, to, cost, unitPrice, unitPriceVAT, consumption, consumptionUnit
                     }
                 }
-                production(resolution: DAILY, last: %d) {
+                production(resolution: HOURLY, first: %d, after: "%s") {
                     nodes {
                         from, to, profit, unitPrice, unitPriceVAT, production, productionUnit
                     }
@@ -234,7 +242,7 @@ def getTibberConsumption(last_n_days = 30):
             }
         }
     }
-    """ % (last_n_days, last_n_days)
+    """ % (max_records, query_after, max_records, query_after)
 
     # compact the query
     res = [line.strip() for line in query.split()]
@@ -258,10 +266,15 @@ def getTibberConsumption(last_n_days = 30):
     assert len(homes) == 1, 'Vopsy, expected single tibber home %s' % homes
     consumption = homes[0]['consumption']['nodes']
     production  = homes[0]['production']['nodes']
-    assert len(consumption) == len(production), 'expected number of consumption and production records to be the same %d != %d' % (consumption, production)
+    assert len(consumption) == len(production), 'expected number of consumption and production records to be the same %s != %s' % (consumption, production)
 
-    tibber_data = list()
-    tibber_date = list()
+    df_resampled['Cost [NOK]']       = 0 # initialize all rows
+    df_resampled['Profit [NOK]']     = 0 # initialize all rows
+    df_resampled['Consumption [Wh]']= 0 # initialize all rows
+    df_resampled['Production [Wh]'] = 0 # initialize all rows
+
+    net_money  = 0
+    net_energy = 0
     for ix in range(len(consumption)):
         c = consumption[ix]
         p = production[ix]
@@ -269,30 +282,119 @@ def getTibberConsumption(last_n_days = 30):
         assert c['consumptionUnit'] == 'kWh'
         assert p['productionUnit']  == 'kWh'
 
-        tibber_date.append(c['from'])
-        tibber_data.append({'Cost [NOK]': c['cost'],
-                            'Profit [NOK]': p['profit'],
-                            'Consumption [kWh]': c['consumption'],
-                            'Production [kWh]': p['production']})
+        net_money += -c['cost']
+        net_money +=  p['profit']
+        net_energy += -1e3*c['consumption']
+        net_energy +=  1e3*p['production']
+        
+        date = pd.to_datetime(c['from'])
+        date_str = date.strftime('%H:%M')
+        ix = df_resampled.index.strftime('%H:%M') == date_str # find corresponding row
 
-    dates = pd.to_datetime(tibber_date)
-    df = pd.DataFrame(tibber_data, index=dates)
+        if any(ix):
+            df_resampled.loc[ix, 'Cost [NOK]']       = c['cost']
+            df_resampled.loc[ix, 'Profit [NOK]']     = p['profit']
+            df_resampled.loc[ix, 'Consumption [Wh]'] = 1e3*c['consumption']
+            df_resampled.loc[ix, 'Production [Wh]'] = 1e3*p['production']
+        else:
+            logger.debug('Ignoring tibber data at %s' % date_str)
+            
+    return df_resampled, (net_money, net_energy)
     
-    return df
+def plot_pv_data(df, df_resampled, title='', tibber_title=''):
+    number_of_plots = 1
+    if 'Temperature [C]' in df_resampled:
+        number_of_plots += 1
+    if 'Consumption [Wh]' in df_resampled:
+        number_of_plots += 1
     
-def plot_pv_data(df, df_resampled, title):
-    fig, ax = plt.subplots()
+    fig, ax = plt.subplots(number_of_plots, 1, figsize=(4.9813, 3.0786*number_of_plots))
 
-    ax.plot(df.index, df['Power [W]'])
-    ax.plot(df_resampled.index, df_resampled['Power [W]'], drawstyle="steps-post")
+    ax[0].plot(df.index, df['Power [W]'])
+    ax[0].plot(df_resampled.index, df_resampled['Power [W]'], drawstyle="steps-post")
 
-    ax.set_xlabel('Time')
-    ax.set_ylabel('Power [W]')
-    ax.set_title(title)
+    ax[0].set_xlabel('Time')
+    ax[0].set_ylabel('Power/Energy [W]/[Wh]')
+    ax[0].set_title(title)
     # format x-axis
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    ax[0].xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
     fig.autofmt_xdate()
 
+    ix_ax = 1
+    if 'Consumption [Wh]' in df_resampled:
+        color = 'tab:blue'
+        ax1 = ax[ix_ax]
+        ix_ax += 1
+        
+        ax1.plot(df_resampled.index, -df_resampled['Consumption [Wh]'],
+                 label='Bought energy', color=color, drawstyle="steps-post")
+        ax1.plot(df_resampled.index, df_resampled['Production [Wh]'],
+                 label='Sold energy', color=color, drawstyle="steps-post")
+        ax1.plot(df_resampled.index, df_resampled['Production [Wh]'] - df_resampled['Consumption [Wh]'],
+                 label='Net energy', color=color, ls='--', drawstyle="steps-post")
+        #ax1.legend(loc='best')
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel('Energy [Wh]', color=color)
+        ax1.tick_params(axis='y', labelcolor=color)
+        ax1.set_title(tibber_title)
+        # format x-axis
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        fig.autofmt_xdate()
+        
+        ylim0 = ax[0].get_ylim() # share axis limit with top plot
+        ylim1 = ax1.get_ylim()
+        # center around zero
+        m = np.amax([np.abs(ylim1), np.abs(ylim0)])
+        ax1.set_ylim(-m, m)
+
+        # second y-axis
+        color = 'tab:red'
+        ax2 = ax1.twinx()
+        ax2.plot(df_resampled.index, -df_resampled['Cost [NOK]'],
+                 label='Bought energy', color=color, drawstyle="steps-post")
+        ax2.plot(df_resampled.index, df_resampled['Profit [NOK]'],
+                 label='Sold energy', color=color, drawstyle="steps-post")
+        ax2.plot(df_resampled.index, df_resampled['Profit [NOK]'] - df_resampled['Cost [NOK]'],
+                 label='Net energy', color=color, ls='--', drawstyle="steps-post")
+        ax2.set_xlabel('Time')
+        ax2.set_ylabel('Money [NOK]', color=color)
+        ax2.tick_params(axis='y', labelcolor=color)
+        ax2.grid(None)        
+        # format x-axis
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        fig.autofmt_xdate()
+        fig.tight_layout()  # otherwise the right y-label is slightly clipped
+        # center around zero
+        ylim = ax2.get_ylim()
+        m = np.max(np.abs(ylim))
+        ax2.set_ylim(-m, m)
+        
+    if 'Temperature [C]' in df_resampled:
+        color = 'tab:blue'
+        ax1 = ax[ix_ax]
+        ix_ax += 1
+        
+        ax1.plot(df_resampled.index, df_resampled['Temperature [C]'], drawstyle="steps-post")
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel('Temperature [C]', color=color)
+        ax1.tick_params(axis='y', labelcolor=color)
+        ax1.set_title('Weather, from OpenWeatherMap')
+        # format x-axis
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        fig.autofmt_xdate()
+
+        # second y-axis
+        color = 'tab:red'
+        ax2 = ax1.twinx()
+        ax2.plot(df_resampled.index, df_resampled['Cloud cover [%]'], color=color, drawstyle="steps-post")
+        ax2.set_xlabel('Time')
+        ax2.set_ylabel('Cloud cover [%]', color=color)
+        ax2.tick_params(axis='y', labelcolor=color)
+        ax2.grid(None)        
+        # format x-axis
+        ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+        fig.autofmt_xdate()
+        fig.tight_layout()  # otherwise the right y-label is slightly clipped
 
 
 if __name__ == '__main__':
@@ -319,8 +421,6 @@ if __name__ == '__main__':
 
     setupLogger(level=args.log_level)
 
-    tibber_data = None
-    
     day_count = 0
     wanted_date = getDateString(args.last_update_date)
     while wanted_date != '' and day_count < int(args.max_days):
@@ -342,19 +442,19 @@ if __name__ == '__main__':
         df = pd.DataFrame(powerlist, index=timelist, columns=['Power [W]'], dtype=int)
         
         # Resample to whole hours and calculate kWh
-        #df_resampled = df.resample('H').mean()
+        df_resampled = df.resample('H').mean()
         dx = 1#(df.index[1] - df.index[0]).total_seconds()/3600
-        def simpson(array_like):
-            # https://stackoverflow.com/a/46787626
-            array_like = array_like.values.astype(float)
-            I = scipy.integrate.simps(array_like, dx=dx)
-            logger.debug('simpson(%s) = %s', array_like, I)
-            return I
+        # def simpson(array_like):
+        #     # https://stackoverflow.com/a/46787626
+        #     array_like = array_like.values.astype(float)
+        #     I = scipy.integrate.simps(array_like, dx=dx)
+        #     logger.debug('simpson(%s) = %.3g', array_like, I)
+        #     return I
 
         # not sure if this is right, try to integrate total power
-        df_resampled = df.resample('H').apply(simpson)
-        sample_rate_s = np.median(np.diff(df.index)).item()*1e-9
-        df_resampled['Power [W]'] *= sample_rate_s/3600
+        # df_resampled = df.resample('H').apply(simpson)
+        # sample_rate_s = np.median(np.diff(df.index)).item()*1e-9
+        # df_resampled['Power [W]'] *= sample_rate_s/3600
         total_kwh = df_resampled['Power [W]'].mean()*24/1e3
         logger.info('Estimated energy production %.0f kWh' % total_kwh)
 
@@ -364,16 +464,16 @@ if __name__ == '__main__':
             logger.exception(e)
 
         if args.tibber:
-            if tibber_data is None:
-                tibber_data = getTibberConsumption()
+            _, tibber_sum = getTibberConsumption(df_resampled, wanted_date, inplace=True)
         
         if args.pvoutput:
             # upload to pvoutput
-            sendUpdateToPVOutput(df, df_resampled, total_kwh, tibber_data)
+            sendUpdateToPVOutput(df, df_resampled, total_kwh, tibber_sum)
             
         if args.plot:
-            title = '%s. Total: %.0f [kWh]' % (wanted_date, total_kwh)
-            plot_pv_data(df, df_resampled, title=title)
+            title = '%s. Total: %.0f [Wh]' % (wanted_date, total_kwh)
+            tibber_title = 'From Tibber: net %.1f kr, %.1f kWh' % (tibber_sum[0], tibber_sum[1]/1e3)
+            plot_pv_data(df, df_resampled, title=title, tibber_title=tibber_title)
             
         # prep for next loop
         day_count += 1
