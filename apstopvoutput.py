@@ -182,10 +182,10 @@ def sendUpdateToPVOutput(df, df_resampled, total_kwh, tibber_sum=None):
         # each hour can contain both consumption and production
         #1e3*(tibber_data.loc[ix, 'Consumption [Wh]'].sum() - tibber_data.loc[ix, 'Production [Wh]'].sum())
         consumption = -tibber_sum[1] # add net_energy
-        print('consumption1', consumption)
+        # print('consumption1', consumption)
         # add generated solar power
         consumption += generated
-        print('consumption2', generated, consumption)
+        # print('consumption2', generated, consumption)
 
         if len(data) == 5:
             # pad with empty data
