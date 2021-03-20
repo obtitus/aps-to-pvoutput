@@ -17,6 +17,8 @@ from pyowm.owm import OWM
 from pyowm.commons.exceptions import APIRequestError
 
 # Note: only needed for plotting
+import matplotlib as mpl
+mpl.rcParams['axes.grid'] = True
 import pylab as plt
 import matplotlib.dates as mdates
 
@@ -59,8 +61,14 @@ def getDateString(last_update_date=None):
             wanted_day = datetime.strptime(FIRST_DATE, "%Y%m%d")
     else:
         wanted_day = datetime.strptime(last_update_date, "%Y%m%d") + timedelta(days=1)
+
+    wanted_date = wanted_day.date()
+    today_date  = datetime.today().date()
     
-    if datetime.today().date() <= wanted_day.date():
+    logger.info('getDateString(%s) -> %s, today = %s',
+                 last_update_date, wanted_date, today_date)
+    
+    if today_date <= wanted_date:
         return '' # if today, stop
     else:
         return wanted_day.strftime("%Y%m%d")
@@ -91,8 +99,9 @@ def getWeather(df_resampled, inplace=True):
     # Retrieve current weather information (Requires the installation of pyowm. $ pip install pyowm)
     owm = OWM(OPENWEATHER) # a Python wrapper around the OpenWeatherMap API
     mgr = owm.weather_manager() # See: https://pyowm.readthedocs.io/en/latest/v3/code-recipes.html
-    
+
     weather = mgr.one_call_history(lat=LAT, lon=LON, dt=round(solar_panel_sunrise))
+        
     #weather.forecast_daily # not sure why this is empty, bug?
     df_resampled['Temperature [C]']  = 0 # initialize all rows
     df_resampled['Status']           = '' # initialize all rows
@@ -214,6 +223,9 @@ def sendUpdateToPVOutput(df, df_resampled, total_kwh, tibber_sum=None):
     logger.info("Response: %s", r.text)
     r.raise_for_status()
 
+class TibberException(Exception):
+    pass
+
 def getTibberConsumption(df_resampled, wanted_date, inplace=False):
     if not(inplace):
         df_resampled = pd.DataFrame(df_resampled)
@@ -275,6 +287,7 @@ def getTibberConsumption(df_resampled, wanted_date, inplace=False):
 
     net_money  = 0
     net_energy = 0
+    number_of_valid_samples = 0
     for ix in range(len(consumption)):
         c = consumption[ix]
         p = production[ix]
@@ -282,6 +295,10 @@ def getTibberConsumption(df_resampled, wanted_date, inplace=False):
         assert c['consumptionUnit'] == 'kWh'
         assert p['productionUnit']  == 'kWh'
 
+        if c['cost'] is None:
+            logger.error('Cost not found %s', c)
+            continue
+        
         net_money += -c['cost']
         net_money +=  p['profit']
         net_energy += -1e3*c['consumption']
@@ -292,13 +309,24 @@ def getTibberConsumption(df_resampled, wanted_date, inplace=False):
         ix = df_resampled.index.strftime('%H:%M') == date_str # find corresponding row
 
         if any(ix):
-            df_resampled.loc[ix, 'Cost [NOK]']       = c['cost']
-            df_resampled.loc[ix, 'Profit [NOK]']     = p['profit']
-            df_resampled.loc[ix, 'Consumption [Wh]'] = 1e3*c['consumption']
-            df_resampled.loc[ix, 'Production [Wh]'] = 1e3*p['production']
+            cost   = c['cost']
+            profit = p['profit']
+            consumption_wh = 1e3*c['consumption']
+            production_wh  = 1e3*p['production']
+            df_resampled.loc[ix, 'Cost [NOK]']       = cost
+            df_resampled.loc[ix, 'Profit [NOK]']     = profit
+            df_resampled.loc[ix, 'Consumption [Wh]'] = consumption_wh
+            df_resampled.loc[ix, 'Production [Wh]']  = production_wh
+            logger.debug('%s Cost %s NOK, Profit %s NOK, consumption %s Wh, production %s Wh',
+                         date_str, cost, profit, consumption_wh, production_wh)
+            number_of_valid_samples += 1
         else:
             logger.debug('Ignoring tibber data at %s' % date_str)
-            
+
+
+    if number_of_valid_samples == 0:
+        raise TibberException("No data found for %s" % wanted_date)
+
     return df_resampled, (net_money, net_energy)
     
 def plot_pv_data(df, df_resampled, title='', tibber_title=''):
@@ -306,7 +334,7 @@ def plot_pv_data(df, df_resampled, title='', tibber_title=''):
     if 'Temperature [C]' in df_resampled:
         number_of_plots += 1
     if 'Consumption [Wh]' in df_resampled:
-        number_of_plots += 1
+        number_of_plots += 2
     
     fig, ax = plt.subplots(number_of_plots, 1, figsize=(4.9813, 3.0786*number_of_plots))
 
@@ -322,44 +350,47 @@ def plot_pv_data(df, df_resampled, title='', tibber_title=''):
 
     ix_ax = 1
     if 'Consumption [Wh]' in df_resampled:
-        color = 'tab:blue'
         ax1 = ax[ix_ax]
         ix_ax += 1
         
         ax1.plot(df_resampled.index, -df_resampled['Consumption [Wh]'],
-                 label='Bought energy', color=color, drawstyle="steps-post")
+                 label='Bought energy', 
+                 drawstyle="steps-post")
         ax1.plot(df_resampled.index, df_resampled['Production [Wh]'],
-                 label='Sold energy', color=color, drawstyle="steps-post")
+                 label='Sold energy',
+                 drawstyle="steps-post")
         ax1.plot(df_resampled.index, df_resampled['Production [Wh]'] - df_resampled['Consumption [Wh]'],
-                 label='Net energy', color=color, ls='--', drawstyle="steps-post")
-        #ax1.legend(loc='best')
+                 label='Net energy',
+                 ls='--',
+                 drawstyle="steps-post")
+        ax1.legend(loc='best')
         ax1.set_xlabel('Time')
-        ax1.set_ylabel('Energy [Wh]', color=color)
-        ax1.tick_params(axis='y', labelcolor=color)
+        ax1.set_ylabel('Energy [Wh]')
         ax1.set_title(tibber_title)
-        # format x-axis
-        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
-        fig.autofmt_xdate()
-        
-        ylim0 = ax[0].get_ylim() # share axis limit with top plot
+
         ylim1 = ax1.get_ylim()
         # center around zero
-        m = np.amax([np.abs(ylim1), np.abs(ylim0)])
+        m = np.max(np.abs(ylim1))
         ax1.set_ylim(-m, m)
 
-        # second y-axis
-        color = 'tab:red'
-        ax2 = ax1.twinx()
+        # second plot, in money
+        ax2 = ax[ix_ax]
+        ix_ax += 1
+
         ax2.plot(df_resampled.index, -df_resampled['Cost [NOK]'],
-                 label='Bought energy', color=color, drawstyle="steps-post")
+                 label='Bought energy', 
+                 drawstyle="steps-post")
         ax2.plot(df_resampled.index, df_resampled['Profit [NOK]'],
-                 label='Sold energy', color=color, drawstyle="steps-post")
+                 label='Sold energy', 
+                 drawstyle="steps-post")
         ax2.plot(df_resampled.index, df_resampled['Profit [NOK]'] - df_resampled['Cost [NOK]'],
-                 label='Net energy', color=color, ls='--', drawstyle="steps-post")
+                 label='Net energy', 
+                 ls='--',
+                 drawstyle="steps-post")
         ax2.set_xlabel('Time')
-        ax2.set_ylabel('Money [NOK]', color=color)
-        ax2.tick_params(axis='y', labelcolor=color)
-        ax2.grid(None)        
+        ax2.set_ylabel('Money [NOK]')
+        ax2.tick_params(axis='y')
+
         # format x-axis
         ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
         fig.autofmt_xdate()
@@ -390,7 +421,7 @@ def plot_pv_data(df, df_resampled, title='', tibber_title=''):
         ax2.set_xlabel('Time')
         ax2.set_ylabel('Cloud cover [%]', color=color)
         ax2.tick_params(axis='y', labelcolor=color)
-        ax2.grid(None)        
+
         # format x-axis
         ax2.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
         fig.autofmt_xdate()
@@ -402,7 +433,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Downloads data from apsystem and uploads to pvoutput.org')
     parser.add_argument('--last_update_date', 
-                        help='Overwrites the last_update_file and use the provided date instead. Analysed date will be +1 day.')
+                        help='Overwrites the last_update_file and use the provided date instead. Analysed date will be +1 day. Format: 20210220')
     parser.add_argument('--plot', action='store_true',
                         default=False,
                         help='Optionally plot data')
@@ -414,6 +445,9 @@ if __name__ == '__main__':
                         help='Optionally download data from tibber.com')
     parser.add_argument('--max_days', '-d', default=30,
                         help='Specify the maximum number of days to process. Defaults to 30 days')
+    parser.add_argument('--do_not_update', '-nu', action='store_true',
+                        default=False,
+                        help='By default, the script will update %s to keep track of which date has been analyzed' % LAST_UPDATE_FILE)
     levels = ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL')
     parser.add_argument('--log_level', default='INFO', choices=levels)
     
@@ -471,13 +505,14 @@ if __name__ == '__main__':
             sendUpdateToPVOutput(df, df_resampled, total_kwh, tibber_sum)
             
         if args.plot:
-            title = '%s. Total: %.0f [Wh]' % (wanted_date, total_kwh)
+            title = 'From APS: %s. Total: %.0f [kWh]' % (wanted_date, total_kwh)
             tibber_title = 'From Tibber: net %.1f kr, %.1f kWh' % (tibber_sum[0], tibber_sum[1]/1e3)
             plot_pv_data(df, df_resampled, title=title, tibber_title=tibber_title)
             
         # prep for next loop
         day_count += 1
-        write_date_to_file(LAST_UPDATE_FILE, wanted_date)
+        if not(args.do_not_update):
+            write_date_to_file(LAST_UPDATE_FILE, wanted_date)
         wanted_date = getDateString()
         
     if args.plot:

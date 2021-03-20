@@ -2,3 +2,4 @@ requests
 pandas
 matplotlib
 pyowm
+scipy
