@@ -86,6 +86,7 @@ def getDataFromAPS(wanted_day):
 
     logger.info('Requesting %s from %s...', data, APSYSTEMS_URL)
     response = requests.post(APSYSTEMS_URL, headers=headers, data=data)
+    response.raise_for_status()
     logger.debug(response)
     return response.json();
 
